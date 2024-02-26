@@ -1,0 +1,287 @@
+---
+title: "Predicting Housing Prices in Cook Country "
+author: "Tarika Jain"
+date: "2024-02-26"
+output: word_document
+---
+
+```{r}
+#This R Script takes about 30 minutes to run
+
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(randomForest)
+options(scipen=999)
+```
+
+
+```{r}
+# A. Loading the data
+
+df <- read_csv("historic_property_data.csv")
+head(df)
+colnames(df)
+str(df)
+```
+
+
+
+```{r}
+#Understanding the outcome variable
+summary(df$sale_price)
+sd(df$sale_price)
+ggplot(df, aes(y = sale_price)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Sale Prices",
+       y = "Sale Price") +
+  theme_minimal()
+
+ggplot(df, aes(x = sale_price)) +
+  geom_histogram(binwidth = 50000, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of Sale Prices",
+       x = "Sale Price",
+       y = "Frequency") +
+  theme_minimal() 
+#We can see that the data has outliers on the higher side of the sale_price
+```
+# B. Data cleaning
+## B.1: Converting numerical fields to categorical fields
+
+```{r}
+
+df <- df %>%
+  mutate(
+    meta_Class = as_factor(meta_class),
+    meta_town_code = as_factor(meta_town_code),
+    meta_nbhd = as_factor(meta_nbhd),
+    meta_cdu = as_factor(meta_cdu),
+    meta_deed_type = as_factor(meta_deed_type),
+    char_air = as_factor(char_air),
+    char_apts = as_factor(char_apts),
+    char_attic_fnsh = as_factor(char_attic_fnsh),
+    char_attic_type = as_factor(char_attic_type),
+    char_bsmt = as_factor(char_bsmt),
+    char_bsmt_fin = as_factor(char_bsmt_fin),
+    char_cnst_qlty = as_factor(char_cnst_qlty),
+    char_ext_wall = as_factor(char_ext_wall),
+    char_gar1_size = as_factor(char_gar1_size),
+    char_gar1_area = as_factor(char_gar1_area),
+    char_gar1_att = as_factor(char_gar1_att),
+    char_gar1_cnst = as_factor(char_gar1_cnst),
+    char_heat = as_factor(char_heat),
+    char_oheat = as_factor(char_oheat),
+    char_porch = as_factor(char_porch),
+    char_renovation = as_factor(char_renovation),
+    char_repair_cnd = as_factor(char_repair_cnd),
+    char_roof_cnst = as_factor(char_roof_cnst),
+    char_site = as_factor(char_site),
+    char_tp_dsgn = as_factor(char_tp_dsgn),
+    char_tp_plan = as_factor(char_tp_plan),
+    char_type_resd = as_factor(char_type_resd),
+    char_use = as_factor(char_use),
+    geo_property_zip = as_factor(geo_property_zip),
+    geo_fips = as_factor(geo_fips),
+    geo_ohare_noise = as_factor(geo_ohare_noise),
+    geo_floodplain = as_factor(geo_floodplain),
+    geo_fs_flood_factor = as_factor(geo_fs_flood_factor),
+    geo_fs_flood_risk_direction = as_factor(geo_fs_flood_risk_direction),
+    geo_withinmr100 = as_factor(geo_withinmr100),
+    geo_withinmr101300 = as_factor(geo_withinmr101300)
+  )
+str(df)
+```
+## B.2.Deleting variables. I delete variables based on 3 conditions - 
+#1) Variables which are recorded as not predictors in the codebook. 
+#2) Variables recorded as inconsistent or unreliable for analysis in the codebook
+#3) Variables which are colinear and hence redundant. Specifically, meta_nbhd is comprised of meta_town_code and is redundant. Similarly number of rooms would include number of bedrooms.
+
+```{r}
+df <- df %>%
+  select(-char_renovation, -char_repair_cnd, -char_site, -geo_asian_perc, -geo_black_perc, -geo_fips, -geo_his_perc, -geo_municipality,  -geo_other_perc, -geo_property_city, -geo_property_zip, -meta_cdu, -geo_tract_pop, -geo_white_perc, -ind_large_home, -char_repair_cnd, -char_site, -char_cnst_qlty, -meta_certified_est_bldg, -meta_certified_est_land, -meta_class,-meta_deed_type, -meta_nbhd, -char_beds)
+
+```
+## B.3. Handling missing values (NA)
+
+```{r}
+data.frame(column = names(df), na_count = colSums(is.na(df)))[order(-colSums(is.na(df))), ]
+
+# since  char_apts, char_porch, char_attic_fnsh and char_tp_dsgn have missing values in more than 25% of the rows, we can exclude them from our dataset.
+df <- df %>%
+  select(-char_apts, -char_porch, -char_attic_fnsh, -char_tp_dsgn, -char_tp_plan)
+
+# imputing mode for categorical variables char_gar1_area, char_gar1_att and char_gar1_cnst
+impute_mode <- function(x) {
+  mode_val <- names(sort(table(x), decreasing = TRUE))[1]
+  x[is.na(x)] <- mode_val
+  return(x)
+}
+
+df$char_gar1_area <- impute_mode(df$char_gar1_area)
+df$char_gar1_att <- impute_mode(df$char_gar1_att)
+df$char_gar1_cnst <- impute_mode(df$char_gar1_cnst)
+
+
+#dropping rows with missing values for the remaining variables (since these are too few)
+df <- df %>%
+  drop_na(char_oheat, char_ext_wall, geo_ohare_noise )
+data.frame(column = names(df), na_count = colSums(is.na(df)))[order(-colSums(is.na(df))), ]
+```
+# C. Variable Selection: Lasso Regression
+# Since the number of variables large, I am fitting a lasso regression for variable selection
+
+```{r}
+# convert a data frame of predictors to a matrix and create dummy variables for categorical variables
+x <- model.matrix(sale_price~0+., data=df)
+y <- df$sale_price
+
+#fitting the model (runntime of about 2-3 minutes)
+set.seed(1)
+fit<-cv.glmnet(x=x, y=y)
+
+# Saving the best lambda
+lambda.best<-fit$lambda.min 
+lambda.best
+
+#Plotting the model
+plot(fit, cex.lab=1.5, cex.axis=1.5, main = "Lasso Regression Model\n\n")
+
+# Examining the coefficients
+length(coef(fit)[which(coef(fit)!=0),])
+length(coef(fit)[which(coef(fit)==0),])
+names(coef(fit)[which(coef(fit)!=0),])
+
+```
+
+# Note: 27 variables had non-zero coefficients. I select these for my prediction model.  
+
+
+```{r}
+selected_var <- c("meta_town_code", "char_age", "char_ext_wall", 
+                        "char_roof_cnst", "char_rooms", "char_bsmt", 
+                       "char_bsmt_fin", "char_air", "char_frpl", "char_attic_type", 
+                       "char_fbath", "char_hbath", "char_gar1_size", "char_gar1_att", "char_gar1_area",  
+                        "char_use", "char_bldg_sf", "char_type_resd", 
+                       "geo_floodplain", "geo_withinmr100", "geo_withinmr101300", "geo_school_elem_district", 
+                       "geo_school_hs_district", "econ_midincome", "ind_garage", 
+                       "econ_tax_rate", "meta_Class")
+
+# Subsetting the data for only the relevant variables
+df <- df %>%
+  select(sale_price, selected_var)
+
+```
+
+
+# D. Creating an ML Model: Random forest
+# I use random forest because of its flexibility and high prediction accuracy in a complex data
+
+```{r}
+set.seed(1)
+rf <- randomForest(sale_price ~ ., data = df, mtry=4)
+summary(rf)
+rf$ntree
+plot(rf, main = "Random Forest Model")
+
+#looking at important variables as per the model
+varImpPlot(rf, main = "Important Variables")
+importance(rf)
+
+
+# F. Testing model performance
+pred_var <- predict(rf, newdata = df)
+residuals <- pred_var - df$sale_price
+sqrt(mean(residuals^2))
+mean(df$sale_price)-mean(pred_var)
+
+ggplot(df, aes(x = sale_price, y = pred_var)) +
+  geom_point(alpha = 0.5) + 
+  geom_abline(intercept = 0, slope = 1, color = "red") +  
+  labs(x = "Actual Sale Prices", y = "Predicted Sale Prices") +
+  ggtitle("Scatter Plot of Actual vs. Predicted Sale Prices")
+
+ggplot(df, aes(x = sale_price, y = residuals)) +
+  geom_point(alpha = 0.5) +  
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +  
+  labs(x = "Actual Sale Prices", y = "Residuals") +
+  ggtitle("Residual Plot")
+```
+
+#E. Generating Predictions 
+
+```{r}
+#pre-processing test data
+test_data <- read_csv("predict_property_data.csv")
+
+test_data <- test_data %>%
+  mutate(
+    meta_Class = as_factor(meta_class),
+    meta_town_code = as_factor(meta_town_code),
+    meta_nbhd = as_factor(meta_nbhd),
+    meta_cdu = as_factor(meta_cdu),
+    meta_deed_type = as_factor(meta_deed_type),
+    char_air = as_factor(char_air),
+    char_apts = as_factor(char_apts),
+    char_attic_fnsh = as_factor(char_attic_fnsh),
+    char_attic_type = as_factor(char_attic_type),
+    char_bsmt = as_factor(char_bsmt),
+    char_bsmt_fin = as_factor(char_bsmt_fin),
+    char_cnst_qlty = as_factor(char_cnst_qlty),
+    char_ext_wall = as_factor(char_ext_wall),
+    char_gar1_size = as_factor(char_gar1_size),
+    char_gar1_area = as_factor(char_gar1_area),
+    char_gar1_att = as_factor(char_gar1_att),
+    char_gar1_cnst = as_factor(char_gar1_cnst),
+    char_heat = as_factor(char_heat),
+    char_oheat = as_factor(char_oheat),
+    char_porch = as_factor(char_porch),
+    char_renovation = as_factor(char_renovation),
+    char_repair_cnd = as_factor(char_repair_cnd),
+    char_roof_cnst = as_factor(char_roof_cnst),
+    char_site = as_factor(char_site),
+    char_tp_dsgn = as_factor(char_tp_dsgn),
+    char_tp_plan = as_factor(char_tp_plan),
+    char_type_resd = as_factor(char_type_resd),
+    char_use = as_factor(char_use),
+    geo_property_zip = as_factor(geo_property_zip),
+    geo_fips = as_factor(geo_fips),
+    geo_ohare_noise = as_factor(geo_ohare_noise),
+    geo_floodplain = as_factor(geo_floodplain),
+    geo_fs_flood_factor = as_factor(geo_fs_flood_factor),
+    geo_fs_flood_risk_direction = as_factor(geo_fs_flood_risk_direction),
+    geo_withinmr100 = as_factor(geo_withinmr100),
+    geo_withinmr101300 = as_factor(geo_withinmr101300)
+  )
+test_subset <- test_data %>%
+  select(selected_var)
+data.frame(column = names(test_subset), na_count = colSums(is.na(test_subset)))[order(-colSums(is.na(test_subset))), ]
+test_subset$char_gar1_area <- impute_mode(test_subset$char_gar1_area)
+test_subset$char_gar1_att <- impute_mode(test_subset$char_gar1_att)
+test_subset$char_ext_wall <- impute_mode(test_subset$char_ext_wall)
+test_subset$char_roof_cnst <- impute_mode(test_subset$char_roof_cnst)
+test_subset$char_bsmt <- impute_mode(test_subset$char_bsmt)
+test_subset$char_bsmt_fin <- impute_mode(test_subset$char_bsmt_fin)
+test_subset$char_air <- impute_mode(test_subset$char_air)
+test_subset$char_frpl <- impute_mode(test_subset$char_frpl)
+test_subset$char_gar1_size <- impute_mode(test_subset$char_gar1_size)
+test_subset$char_use <- impute_mode(test_subset$char_use)
+test_subset$char_type_resd <- impute_mode(test_subset$char_type_resd)
+test_subset$ind_garage <- impute_mode(test_subset$ind_garage)
+test_subset$char_attic_type <- impute_mode(test_subset$char_attic_type)
+# running the model
+
+predictions <- predict(rf, newdata = test_subset)
+
+final_df <- data.frame(pid=test_data$pid, assessed_value=predictions)
+head(final_df)
+summary(final_df)
+
+#Comparing the values
+summary(df$sale_price)
+summary(final_df$assessed_value)
+sd(final_df$assessed_value)
+
+write.csv(final_df, "assessed_value.csv", row.names=FALSE)
+```
+
